@@ -1,6 +1,6 @@
 package com.epam.hubd.spark.scala.core.homework
 
-import com.epam.hubd.spark.scala.core.homework.domain.{BidItem, EnrichedItem}
+import com.epam.hubd.spark.scala.core.homework.domain.{BidError, BidItem, EnrichedItem}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.{SparkConf, SparkContext}
 
@@ -8,6 +8,7 @@ object MotelsHomeRecommendation {
 
   val ERRONEOUS_DIR: String = "erroneous"
   val AGGREGATED_DIR: String = "aggregated"
+  val ERRONEOUS_STRING: String = "ERROR_"
 
   def main(args: Array[String]): Unit = {
     require(args.length == 4, "Provide parameters in this order: bidsPath, motelsPath, exchangeRatesPath, outputBasePath")
@@ -73,15 +74,64 @@ object MotelsHomeRecommendation {
     enriched.saveAsTextFile(s"$outputBasePath/$AGGREGATED_DIR")
   }
 
-  def getRawBids(sc: SparkContext, bidsPath: String): RDD[List[String]] = ???
+  def getRawBids(sc: SparkContext, bidsPath: String): RDD[List[String]] = {
+    sc.textFile(bidsPath, 3).map(s => s.split(Constants.DELIMITER).toList)
+  }
 
-  def getErroneousRecords(rawBids: RDD[List[String]]): RDD[String] = ???
+  def getErroneousRecords(rawBids: RDD[List[String]]): RDD[String] = {
+    rawBids.filter(r => r(2)
+      .startsWith(ERRONEOUS_STRING))
+      .map(r => (BidError(r(1), r(2)), 1))
+      .reduceByKey(_+_)
+      .map(t => t._1.toString + Constants.DELIMITER + t._2)
+  }
 
-  def getExchangeRates(sc: SparkContext, exchangeRatesPath: String): Map[String, Double] = ???
+  def getExchangeRates(sc: SparkContext, exchangeRatesPath: String): Map[String, Double] = {
+    sc.textFile(exchangeRatesPath, 2).map(s => s.split(Constants.DELIMITER))
+      .map(arr => (arr(0), arr(3).toDouble))
+      .collect()
+      .toMap
+  }
 
-  def getBids(rawBids: RDD[List[String]], exchangeRates: Map[String, Double]): RDD[BidItem] = ???
+  def getBids(rawBids: RDD[List[String]], exchangeRates: Map[String, Double]): RDD[BidItem] = {
+    rawBids.filter(s => !s(2).startsWith(ERRONEOUS_STRING)).flatMap(data => parseBid(data, exchangeRates))
+  }
 
-  def getMotels(sc:SparkContext, motelsPath: String): RDD[(String, String)] = ???
+  implicit class OpsNum(val str: String) extends AnyVal {
+    def isNumeric: Boolean = scala.util.Try(str.toDouble).isSuccess
+  }
 
-  def getEnriched(bids: RDD[BidItem], motels: RDD[(String, String)]): RDD[EnrichedItem] = ???
+  def exchangeMoney(bidPrice: Double, exchangeRate: Double): Double = {
+    BigDecimal(bidPrice * exchangeRate).setScale(3, BigDecimal.RoundingMode.HALF_UP).toDouble
+  }
+
+  def parseBid(data: List[String], exchangeRates: Map[String, Double]): List[BidItem] = {
+    val date = data(Constants.BIDS_HEADER.indexOf("BidDate"))
+    val outputDate = Constants.OUTPUT_DATE_FORMAT.print(Constants.INPUT_DATE_FORMAT.parseDateTime(date))
+    val id = data(Constants.BIDS_HEADER.indexOf("MotelID"))
+    val exchangeRate: Double = exchangeRates.getOrElse(date, 0)
+
+    Constants.TARGET_LOSAS.map(losa => (losa, data(Constants.BIDS_HEADER.indexOf(losa))))
+      .filter(id2price => id2price._2.isNumeric)
+      .map(id2price => BidItem(id, outputDate, id2price._1, exchangeMoney(id2price._2.toDouble, exchangeRate)))
+      .toList
+  }
+
+  def getMotels(sc:SparkContext, motelsPath: String): RDD[(String, String)] = {
+    sc.textFile(motelsPath, 3)
+      .map(s => s.split(Constants.DELIMITER))
+      .map(arr => (arr(Constants.MOTELS_HEADER.indexOf("MotelID")), arr(Constants.MOTELS_HEADER.indexOf("MotelName"))))
+  }
+
+  def getEnriched(bids: RDD[BidItem], motels: RDD[(String, String)]): RDD[EnrichedItem] = {
+    bids.map(b => (b.motelId, b))
+      .join(motels)
+      .map {
+        case (id, (bid, motelName)) => ((id, bid.bidDate), EnrichedItem(id, motelName, bid.bidDate, bid.loSa, bid.price))
+      }
+      .reduceByKey((a, b) => if(a.price >= b.price) a else b)
+      .map(loSa2enriched => loSa2enriched._2)
+  }
+
+
 }
